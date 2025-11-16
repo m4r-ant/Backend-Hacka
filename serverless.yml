@@ -13,8 +13,8 @@ provider:
     CONNECTIONS_TABLE: ${sls:stage}-t_conexiones
     WS_ENDPOINT: https://zisd0y9a8j.execute-api.us-east-1.amazonaws.com/dev
     # 🔽 Añade estas dos líneas:
-    QA_EMAILS: "qa1@ejemplo.com,qa2@ejemplo.com"  # destinatarios QA
-    FROM_EMAIL: "remitente-verificado@tudominio.com"  # correo verificado en SES
+    QA_EMAILS: "marco.galindo.b@utec.edu.pe,galindomarco942@gmail.com"  # destinatarios QA
+    FROM_EMAIL: "marco.galindo.b@utec.edu.pe"  # correo verificado en SES
 
 functions:
   crearIncidente:
