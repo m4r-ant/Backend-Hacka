@@ -1,98 +1,124 @@
+# handlers/ws_handler.py
 import json
 import os
-from datetime import datetime
 
 import boto3
+from botocore.exceptions import ClientError
 
 dynamodb = boto3.resource("dynamodb")
-CONNECTIONS_TABLE_NAME = os.environ["CONNECTIONS_TABLE"]
-connections_table = dynamodb.Table(CONNECTIONS_TABLE_NAME)
+
+CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE")
+WS_ENDPOINT = os.environ.get("WS_ENDPOINT")
 
 
-def _get_ws_client(event):
-    """
-    Crea el cliente para API Gateway Management API
-    usando dominio y stage del evento de WebSocket.
-    (Se usa solo en la ruta broadcast activada por el cliente).
-    """
-    domain = event["requestContext"]["domainName"]
-    stage = event["requestContext"]["stage"]
+def _get_apigw_client():
+    if not WS_ENDPOINT:
+        raise RuntimeError("WS_ENDPOINT no está configurado")
 
-    return boto3.client(
-        "apigatewaymanagementapi",
-        endpoint_url=f"https://{domain}/{stage}",
-    )
+    return boto3.client("apigatewaymanagementapi", endpoint_url=WS_ENDPOINT)
 
 
 def connect(event, context):
+    """
+    $connect
+    Guarda la conexión en DynamoDB.
+    """
+    print("WS $connect event:", event)
+
     connection_id = event["requestContext"]["connectionId"]
-    print("WS connect:", connection_id)
+    table = dynamodb.Table(CONNECTIONS_TABLE)
 
-    connections_table.put_item(
-        Item={
-            "connectionId": connection_id,
-            "connectedAt": datetime.utcnow().isoformat(),
-        }
-    )
+    table.put_item(Item={"connectionId": connection_id})
 
-    return {"statusCode": 200, "body": "Connected"}
+    return {
+        "statusCode": 200,
+        "body": "Connected.",
+    }
 
 
 def disconnect(event, context):
+    """
+    $disconnect
+    Elimina la conexión de DynamoDB.
+    """
+    print("WS $disconnect event:", event)
+
     connection_id = event["requestContext"]["connectionId"]
-    print("WS disconnect:", connection_id)
+    table = dynamodb.Table(CONNECTIONS_TABLE)
 
-    connections_table.delete_item(Key={"connectionId": connection_id})
+    table.delete_item(Key={"connectionId": connection_id})
 
-    return {"statusCode": 200, "body": "Disconnected"}
+    return {
+        "statusCode": 200,
+        "body": "Disconnected.",
+    }
 
 
 def default_handler(event, context):
-    print("WS default message:", event.get("body"))
-    return {"statusCode": 200, "body": "OK"}
+    """
+    $default
+    Cualquier mensaje que no caiga en una ruta específica.
+    """
+    print("WS $default event:", event)
+
+    body = event.get("body")
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        data = {"raw": body}
+
+    print("Mensaje recibido por WebSocket:", data)
+
+    return {
+        "statusCode": 200,
+        "body": "OK",
+    }
 
 
 def broadcast(event, context):
     """
-    Ruta opcional:
-    El cliente puede mandar un mensaje para que el backend
-    lo reenvíe a todos.
-
-    Body esperado:
-    {
-      "action": "broadcast",
-      "type": "MENSAJE_CUSTOM",
-      "payload": { ... }
-    }
+    Ruta 'broadcast' del WebSocket.
+    Envía un mensaje a todos los clientes conectados.
+    El body puede tener 'message' o cualquier payload.
     """
+    print("WS broadcast event:", event)
+
     try:
-        ws_client = _get_ws_client(event)
         body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        body = {}
 
-        message = json.dumps(
-            {
-                "type": body.get("type", "EVENT"),
-                "payload": body.get("payload", {}),
-            }
-        )
+    # Mensaje estándar
+    payload = {
+        "action": body.get("action", "broadcast"),
+        "message": body.get("message", "Hola desde broadcast"),
+        "data": body.get("data", {}),
+    }
 
-        scan_res = connections_table.scan(ProjectionExpression="connectionId")
-        items = scan_res.get("Items", [])
+    apigw = _get_apigw_client()
+    table = dynamodb.Table(CONNECTIONS_TABLE)
 
-        for item in items:
-            cid = item["connectionId"]
-            try:
-                ws_client.post_to_connection(
-                    ConnectionId=cid,
-                    Data=message.encode("utf-8"),
-                )
-            except ws_client.exceptions.GoneException:
-                print("Conexión muerta, eliminando:", cid)
-                connections_table.delete_item(Key={"connectionId": cid})
-            except Exception as e:
-                print("Error enviando a", cid, ":", e)
+    resp = table.scan()
+    connections = resp.get("Items", [])
 
-        return {"statusCode": 200, "body": "Broadcast OK"}
-    except Exception as e:
-        print("Error en broadcast:", e)
-        return {"statusCode": 500, "body": "Error en broadcast"}
+    print(f"Broadcast a {len(connections)} conexiones.")
+    data_bytes = json.dumps(payload).encode("utf-8")
+
+    for conn in connections:
+        connection_id = conn.get("connectionId")
+        if not connection_id:
+            continue
+
+        try:
+            apigw.post_to_connection(ConnectionId=connection_id, Data=data_bytes)
+        except ClientError as e:
+            status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            print(f"Error enviando a {connection_id}:", e)
+            if status == 410:
+                print(f"Conexión {connection_id} muerta, eliminando.")
+                table.delete_item(Key={"connectionId": connection_id})
+
+    return {
+        "statusCode": 200,
+        "body": "Broadcast enviado.",
+    }
