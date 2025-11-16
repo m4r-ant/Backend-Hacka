@@ -1,4 +1,4 @@
-org: m4rant
+org: geraldocolchado
 service: alerta-utec
 
 provider:
@@ -7,11 +7,14 @@ provider:
   memorySize: 1024
   timeout: 30
   iam:
-    # --CAMBIAN EL ROLE SEGUN SU CUENTA DE AWS--
+    # Igual que en tu ejemplo de AWS Academy
     role: arn:aws:iam::606646193182:role/LabRole
   environment:
     INCIDENTS_TABLE: ${sls:stage}-t_incidentes
     CONNECTIONS_TABLE: ${sls:stage}-t_conexiones
+    # 👇 Cambia esto por tu endpoint real de WebSocket de API Gateway (⚠️ IMPORTANTE)
+    # Debe ser de la forma: https://<api-id>.execute-api.<region>.amazonaws.com/<stage>
+    WS_ENDPOINT: https://zisd0y9a8j.execute-api.us-east-1.amazonaws.com/dev
 
 functions:
   # --- HTTP API: Incidentes ---
