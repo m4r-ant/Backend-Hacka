@@ -11,8 +11,9 @@ connections_table = dynamodb.Table(CONNECTIONS_TABLE_NAME)
 
 def _get_ws_client(event):
     """
-    Crea el cliente para API Gateway WebSocket (Management API)
-    usando el dominio y stage de la invocación.
+    Crea el cliente para API Gateway Management API
+    usando dominio y stage del evento de WebSocket.
+    (Se usa solo en la ruta broadcast activada por el cliente).
     """
     domain = event["requestContext"]["domainName"]
     stage = event["requestContext"]["stage"]
@@ -41,9 +42,7 @@ def disconnect(event, context):
     connection_id = event["requestContext"]["connectionId"]
     print("WS disconnect:", connection_id)
 
-    connections_table.delete_item(
-        Key={"connectionId": connection_id}
-    )
+    connections_table.delete_item(Key={"connectionId": connection_id})
 
     return {"statusCode": 200, "body": "Disconnected"}
 
@@ -55,14 +54,15 @@ def default_handler(event, context):
 
 def broadcast(event, context):
     """
-    El cliente envía por WebSocket algo como:
+    Ruta opcional:
+    El cliente puede mandar un mensaje para que el backend
+    lo reenvíe a todos.
+
+    Body esperado:
     {
       "action": "broadcast",
-      "type": "INCIDENT_UPDATED",
-      "payload": {
-        "incidentId": "...",
-        "status": "en_atencion"
-      }
+      "type": "MENSAJE_CUSTOM",
+      "payload": { ... }
     }
     """
     try:
@@ -76,7 +76,6 @@ def broadcast(event, context):
             }
         )
 
-        # Leer todas las conexiones
         scan_res = connections_table.scan(ProjectionExpression="connectionId")
         items = scan_res.get("Items", [])
 
@@ -88,7 +87,6 @@ def broadcast(event, context):
                     Data=message.encode("utf-8"),
                 )
             except ws_client.exceptions.GoneException:
-                # Conexión muerta: la borramos
                 print("Conexión muerta, eliminando:", cid)
                 connections_table.delete_item(Key={"connectionId": cid})
             except Exception as e:
