@@ -1,0 +1,88 @@
+org: m4rant
+service: alerta-utec
+
+provider:
+  name: aws
+  runtime: python3.12
+  memorySize: 1024
+  timeout: 30
+  iam:
+    # --CAMBIAN EL ROLE SEGUN SU CUENTA DE AWS--
+    role: arn:aws:iam::606646193182:role/LabRole
+  environment:
+    INCIDENTS_TABLE: ${sls:stage}-t_incidentes
+    CONNECTIONS_TABLE: ${sls:stage}-t_conexiones
+
+functions:
+  # --- HTTP API: Incidentes ---
+  crearIncidente:
+    handler: handlers/incident_handler.crear_incidente
+    events:
+      - httpApi:
+          path: /incidentes
+          method: post
+
+  listarIncidentes:
+    handler: handlers/incident_handler.listar_incidentes
+    events:
+      - httpApi:
+          path: /incidentes
+          method: get
+
+  actualizarIncidente:
+    handler: handlers/incident_handler.actualizar_incidente
+    events:
+      - httpApi:
+          path: /incidentes/{id}
+          method: patch
+
+  # --- WebSocket API: Tiempo real ---
+  wsConnect:
+    handler: handlers/ws_handler.connect
+    events:
+      - websocket:
+          route: $connect
+
+  wsDisconnect:
+    handler: handlers/ws_handler.disconnect
+    events:
+      - websocket:
+          route: $disconnect
+
+  wsDefault:
+    handler: handlers/ws_handler.default_handler
+    events:
+      - websocket:
+          route: $default
+
+  wsBroadcast:
+    handler: handlers/ws_handler.broadcast
+    events:
+      - websocket:
+          route: broadcast
+
+resources:
+  Resources:
+    IncidentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.INCIDENTS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: incidentId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: incidentId
+            KeyType: HASH
+
+    ConnectionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.CONNECTIONS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: connectionId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: connectionId
+            KeyType: HASH
