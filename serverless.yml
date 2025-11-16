@@ -1,4 +1,4 @@
-org: geraldocolchado
+org: m4rant
 service: alerta-utec
 
 provider:
@@ -7,17 +7,16 @@ provider:
   memorySize: 1024
   timeout: 30
   iam:
-    # Igual que en tu ejemplo de AWS Academy
-    role: arn:aws:iam::606646193182:role/LabRole
+    role: arn:aws:iam::722204368591:role/LabRole
   environment:
     INCIDENTS_TABLE: ${sls:stage}-t_incidentes
     CONNECTIONS_TABLE: ${sls:stage}-t_conexiones
-    # 👇 Cambia esto por tu endpoint real de WebSocket de API Gateway (⚠️ IMPORTANTE)
-    # Debe ser de la forma: https://<api-id>.execute-api.<region>.amazonaws.com/<stage>
     WS_ENDPOINT: https://zisd0y9a8j.execute-api.us-east-1.amazonaws.com/dev
+    # 🔽 Añade estas dos líneas:
+    QA_EMAILS: "qa1@ejemplo.com,qa2@ejemplo.com"  # destinatarios QA
+    FROM_EMAIL: "remitente-verificado@tudominio.com"  # correo verificado en SES
 
 functions:
-  # --- HTTP API: Incidentes ---
   crearIncidente:
     handler: handlers/incident_handler.crear_incidente
     events:
@@ -39,7 +38,6 @@ functions:
           path: /incidentes/{id}
           method: patch
 
-  # --- WebSocket API: Tiempo real ---
   wsConnect:
     handler: handlers/ws_handler.connect
     events:
