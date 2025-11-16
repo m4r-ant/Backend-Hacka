@@ -1,162 +1,253 @@
+# handlers/incident_handler.py
 import json
 import os
 import uuid
 from datetime import datetime
 
 import boto3
+from botocore.exceptions import ClientError
 
 dynamodb = boto3.resource("dynamodb")
+ses = boto3.client("ses")
 
-INCIDENTS_TABLE_NAME = os.environ["INCIDENTS_TABLE"]
-CONNECTIONS_TABLE_NAME = os.environ["CONNECTIONS_TABLE"]
+INCIDENTS_TABLE = os.environ.get("INCIDENTS_TABLE")
+CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE")
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT")
-
-incidents_table = dynamodb.Table(INCIDENTS_TABLE_NAME)
-connections_table = dynamodb.Table(CONNECTIONS_TABLE_NAME)
+QA_EMAILS = os.environ.get("QA_EMAILS", "")
+FROM_EMAIL = os.environ.get("FROM_EMAIL")
 
 
 def _response(status_code, body):
     return {
         "statusCode": status_code,
         "headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": True,
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",  # CORS simple
         },
         "body": json.dumps(body),
     }
 
 
-def _broadcast_ws(message_type: str, payload: dict):
+def _send_email_to_qa(incident):
     """
-    Envía un mensaje a TODOS los clientes conectados al WebSocket.
-    Se llama automáticamente al crear o actualizar un incidente.
+    Envía correo a los QA usando Amazon SES.
+    QA_EMAILS = "qa1@...,qa2@..."
+    FROM_EMAIL debe estar verificado en SES.
     """
-    if not WS_ENDPOINT:
-        print("WS_ENDPOINT no está definido, no se envía broadcast.")
+    if not QA_EMAILS or not FROM_EMAIL:
+        print("QA_EMAILS o FROM_EMAIL no configurados, no se enviará correo.")
         return
 
-    # Cliente para API Gateway Management API
-    ws_client = boto3.client(
-        "apigatewaymanagementapi",
-        endpoint_url=WS_ENDPOINT,
+    recipients = [e.strip() for e in QA_EMAILS.split(",") if e.strip()]
+    if not recipients:
+        print("No hay correos QA válidos.")
+        return
+
+    subject = f"Nuevo incidente reportado: {incident.get('title', 'Sin título')}"
+    body_text = (
+        "Se ha registrado un nuevo incidente:\n\n"
+        f"ID: {incident.get('incidentId')}\n"
+        f"Título: {incident.get('title')}\n"
+        f"Descripción: {incident.get('description')}\n"
+        f"Ubicación: {incident.get('location')}\n"
+        f"Urgencia: {incident.get('urgency')}\n"
+        f"Estado: {incident.get('status')}\n"
+        f"Reportado por: {incident.get('reportedBy')}\n"
+        f"Fecha: {incident.get('createdAt')}\n"
     )
 
-    data = connections_table.scan(ProjectionExpression="connectionId")
-    items = data.get("Items", [])
+    try:
+        print(f"Enviando correo a QA: {recipients}")
+        ses.send_email(
+            Source=FROM_EMAIL,
+            Destination={"ToAddresses": recipients},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": body_text}},
+            },
+        )
+    except ClientError as e:
+        print("Error enviando correo SES:", e)
 
-    message = json.dumps(
-        {
-            "type": message_type,
-            "payload": payload,
-        }
-    )
 
-    for item in items:
-        connection_id = item["connectionId"]
+def _get_apigw_client():
+    """
+    Cliente para API Gateway Management API, usando el WS_ENDPOINT
+    que tienes configurado en las env vars.
+    """
+    if not WS_ENDPOINT:
+        raise RuntimeError("WS_ENDPOINT no está configurado")
+
+    return boto3.client("apigatewaymanagementapi", endpoint_url=WS_ENDPOINT)
+
+
+def _notify_all_connections(payload):
+    """
+    Envía un mensaje con action: "notify" a TODAS las conexiones
+    guardadas en la tabla CONNECTIONS_TABLE.
+    """
+    if not CONNECTIONS_TABLE:
+        print("CONNECTIONS_TABLE no configurado, no se enviarán notificaciones.")
+        return
+
+    table = dynamodb.Table(CONNECTIONS_TABLE)
+    apigw = _get_apigw_client()
+
+    # message que verá el WebSocket en el front
+    message = {
+        "action": "notify",  # 👈 lo que tu front va a leer
+        **payload,
+    }
+
+    data_bytes = json.dumps(message).encode("utf-8")
+
+    scan_kwargs = {"TableName": CONNECTIONS_TABLE}
+    response = table.scan()
+    connections = response.get("Items", [])
+
+    print(f"Enviando notificación a {len(connections)} conexiones WebSocket.")
+
+    for conn in connections:
+        connection_id = conn.get("connectionId")
+        if not connection_id:
+            continue
+
         try:
-            ws_client.post_to_connection(
-                ConnectionId=connection_id,
-                Data=message.encode("utf-8"),
-            )
-        except ws_client.exceptions.GoneException:
-            # Conexión muerta: la borramos
-            print("Conexión muerta, eliminando:", connection_id)
-            connections_table.delete_item(Key={"connectionId": connection_id})
-        except Exception as e:
+            apigw.post_to_connection(ConnectionId=connection_id, Data=data_bytes)
+        except ClientError as e:
+            status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             print(f"Error enviando a {connection_id}: {e}")
+            if status == 410:
+                # Conexión muerta, la borramos
+                print(f"Conexión {connection_id} muerta, eliminando.")
+                table.delete_item(Key={"connectionId": connection_id})
 
+
+# ---------- HANDLERS PUBLICOS ----------
 
 def crear_incidente(event, context):
     """
     POST /incidentes
-    Body JSON:
-    {
-      "tipo": "infraestructura",
-      "ubicacion": "Piso 3, aula 304",
-      "descripcion": "Fuga de agua",
-      "urgencia": "alta"
-    }
+    Crea incidente, envía correo QA y notifica via WebSocket (action: 'notify')
     """
+    print("Evento crear_incidente:", event)
+
     try:
         body = json.loads(event.get("body") or "{}")
-        now = datetime.utcnow().isoformat()
+    except json.JSONDecodeError:
+        return _response(400, {"message": "Body inválido, debe ser JSON"})
 
-        incident_id = str(uuid.uuid4())
+    incident_id = str(uuid.uuid4())
+    now_iso = datetime.utcnow().isoformat()
 
-        item = {
-            "incidentId": incident_id,
-            "tipo": body.get("tipo", "otro"),
-            "ubicacion": body.get("ubicacion", "desconocida"),
-            "descripcion": body.get("descripcion", ""),
-            "urgencia": body.get("urgencia", "media"),
-            "estado": "pendiente",
-            "createdAt": now,
-            "updatedAt": now,
-            # Aquí podrías agregar createdBy, rol, etc.
-        }
+    incident = {
+        "incidentId": incident_id,
+        "title": body.get("title", "Incidente sin título"),
+        "description": body.get("description", ""),
+        "location": body.get("location", ""),
+        "urgency": body.get("urgency", "media"),
+        "status": body.get("status", "pendiente"),
+        "reportedBy": body.get("reportedBy", "anónimo"),
+        "createdAt": now_iso,
+    }
 
-        incidents_table.put_item(Item=item)
+    table = dynamodb.Table(INCIDENTS_TABLE)
 
-        # 🔔 Notificar a todos por WebSocket
-        _broadcast_ws("INCIDENT_CREATED", item)
+    try:
+        table.put_item(Item=incident)
+        # 1. Enviar correo a QA
+        _send_email_to_qa(incident)
+        # 2. Notificar a todos los clientes WebSocket
+        _notify_all_connections(
+            {
+                "incidentId": incident_id,
+                "title": incident["title"],
+                "urgency": incident["urgency"],
+                "location": incident["location"],
+                "status": incident["status"],
+                "createdAt": incident["createdAt"],
+            }
+        )
 
-        return _response(201, item)
-    except Exception as e:
-        print("Error en crear_incidente:", e)
-        return _response(500, {"error": "Error creando incidente"})
+        return _response(
+            201,
+            {
+                "ok": True,
+                "message": "Incidente creado, correo enviado y notificación enviada",
+                "incident": incident,
+            },
+        )
+    except ClientError as e:
+        print("Error al crear incidente:", e)
+        return _response(
+            500,
+            {"ok": False, "message": "Error al crear incidente", "error": str(e)},
+        )
 
 
 def listar_incidentes(event, context):
     """
     GET /incidentes
-    (Por simplicidad, lista todos. Podrías filtrar por estado usando query params)
     """
+    print("Evento listar_incidentes:", event)
+
+    table = dynamodb.Table(INCIDENTS_TABLE)
     try:
-        res = incidents_table.scan()
-        items = res.get("Items", [])
-        return _response(200, items)
-    except Exception as e:
-        print("Error en listar_incidentes:", e)
-        return _response(500, {"error": "Error listando incidentes"})
+        resp = table.scan()
+        items = resp.get("Items", [])
+        return _response(200, {"ok": True, "items": items})
+    except ClientError as e:
+        print("Error al listar incidentes:", e)
+        return _response(500, {"ok": False, "message": "Error al listar", "error": str(e)})
 
 
 def actualizar_incidente(event, context):
     """
     PATCH /incidentes/{id}
-    Body JSON (ejemplo):
-    {
-      "estado": "en_atencion",
-      "urgencia": "alta",
-      "assignedTo": "Mantenimiento"
-    }
     """
+    print("Evento actualizar_incidente:", event)
+
+    path_params = event.get("pathParameters") or {}
+    incident_id = path_params.get("id")
+
+    if not incident_id:
+        return _response(400, {"message": "Falta id en la ruta"})
+
     try:
-        incident_id = event["pathParameters"]["id"]
         body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _response(400, {"message": "Body inválido, debe ser JSON"})
 
-        current = incidents_table.get_item(
-            Key={"incidentId": incident_id}
-        ).get("Item")
+    # Construimos UpdateExpression dinámico
+    update_expr_parts = []
+    expr_attr_values = {}
+    expr_attr_names = {}
 
-        if not current:
-            return _response(404, {"error": "Incidente no encontrado"})
+    for key in ["title", "description", "location", "urgency", "status", "reportedBy"]:
+        if key in body:
+            update_expr_parts.append(f"#k_{key} = :v_{key}")
+            expr_attr_values[f":v_{key}"] = body[key]
+            expr_attr_names[f"#k_{key}"] = key
 
-        now = datetime.utcnow().isoformat()
+    if not update_expr_parts:
+        return _response(400, {"message": "No hay campos para actualizar"})
 
-        updated = {
-            **current,
-            "estado": body.get("estado", current.get("estado", "pendiente")),
-            "urgencia": body.get("urgencia", current.get("urgencia", "media")),
-            "assignedTo": body.get("assignedTo", current.get("assignedTo")),
-            "updatedAt": now,
-        }
+    update_expr = "SET " + ", ".join(update_expr_parts)
 
-        incidents_table.put_item(Item=updated)
+    table = dynamodb.Table(INCIDENTS_TABLE)
 
-        # 🔔 Notificar actualización por WebSocket
-        _broadcast_ws("INCIDENT_UPDATED", updated)
+    try:
+        resp = table.update_item(
+            Key={"incidentId": incident_id},
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames=expr_attr_names,
+            ExpressionAttributeValues=expr_attr_values,
+            ReturnValues="ALL_NEW",
+        )
 
-        return _response(200, updated)
-    except Exception as e:
-        print("Error en actualizar_incidente:", e)
-        return _response(500, {"error": "Error actualizando incidente"})
+        updated = resp.get("Attributes", {})
+        return _response(200, {"ok": True, "incident": updated})
+    except ClientError as e:
+        print("Error al actualizar incidente:", e)
+        return _response(500, {"ok": False, "message": "Error al actualizar", "error": str(e)})
