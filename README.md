@@ -247,11 +247,3 @@ El backend de Alerta UTEC combina REST + WebSocket + SNS en una arquitectura ser
 * notificar a administradores automáticamente
 * distribuir alertas en tiempo real a múltiples dashboards
 * escalar sin servidores ni costos fijos
-
----
-
-Si quieres te genero:
-
-* versión **resumida**,
-* versión **más técnica**,
-* o el README completo con instalación + comandos + screenshots.
