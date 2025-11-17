@@ -4,19 +4,35 @@ service: alerta-utec
 provider:
   name: aws
   runtime: python3.12
+  region: us-east-1
   memorySize: 1024
-  timeout: 30
+  timeout: 20
   iam:
-    role: arn:aws:iam::722204368591:role/LabRole
+    role: arn:aws:iam::722204368591:role/LabRole  # 👈 tu LabRole
+
+  # CORS para que el frontend (localhost:5173) pueda llamar sin errores
+  httpApi:
+    cors:
+      allowedOrigins:
+        - http://localhost:5173   # frontend local
+        - "*"                     # opcional
+      allowedMethods:
+        - GET
+        - POST
+        - PATCH
+        - OPTIONS
+      allowedHeaders:
+        - Content-Type
+
   environment:
     INCIDENTS_TABLE: ${sls:stage}-t_incidentes
     CONNECTIONS_TABLE: ${sls:stage}-t_conexiones
     WS_ENDPOINT: https://zisd0y9a8j.execute-api.us-east-1.amazonaws.com/dev
-    # 🔽 Añade estas dos líneas:
-    QA_EMAILS: "marco.galindo.b@utec.edu.pe,galindomarco942@gmail.com"  # destinatarios QA
-    FROM_EMAIL: "marco.galindo.b@utec.edu.pe"  # correo verificado en SES
+    # 👇 CAMBIA esto por el ARN REAL de tu SNS topic
+    SNS_TOPIC_ARN: arn:aws:sns:us-east-1:722204368591:alerta-utec
 
 functions:
+  # --- HTTP: API de incidentes ---
   crearIncidente:
     handler: handlers/incident_handler.crear_incidente
     events:
@@ -38,6 +54,7 @@ functions:
           path: /incidentes/{id}
           method: patch
 
+  # --- WebSocket: tiempo real ---
   wsConnect:
     handler: handlers/ws_handler.connect
     events:
@@ -55,12 +72,6 @@ functions:
     events:
       - websocket:
           route: $default
-
-  wsBroadcast:
-    handler: handlers/ws_handler.broadcast
-    events:
-      - websocket:
-          route: broadcast
 
 resources:
   Resources:
@@ -87,3 +98,4 @@ resources:
         KeySchema:
           - AttributeName: connectionId
             KeyType: HASH
+
