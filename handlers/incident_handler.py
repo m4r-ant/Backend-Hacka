@@ -1,4 +1,5 @@
 # handlers/incident_handler.py
+
 import json
 import os
 import uuid
@@ -7,21 +8,30 @@ from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
 
-dynamodb = boto3.resource("dynamodb")
-ses = boto3.client("ses")
+# -------- Variables de entorno --------
 
 INCIDENTS_TABLE = os.environ.get("INCIDENTS_TABLE")
 CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE")
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT")
-QA_EMAILS = os.environ.get("QA_EMAILS", "")
-FROM_EMAIL = os.environ.get("FROM_EMAIL")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+sns = boto3.client("sns", region_name=AWS_REGION)
+
+
+# -----------------------------------------------------
+# RESPUESTA ESTÁNDAR (CON CORS)
+# -----------------------------------------------------
 
 def _response(status_code, body):
     return {
         "statusCode": status_code,
         "headers": {
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": "*",   # o "http://localhost:5173"
+            "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
             "Access-Control-Allow-Credentials": True,
             "Content-Type": "application/json",
         },
@@ -29,84 +39,36 @@ def _response(status_code, body):
     }
 
 
-def _send_email_to_qa(incident):
-    """
-    Envía correo a los QA usando Amazon SES.
-    QA_EMAILS = "qa1@...,qa2@..."
-    FROM_EMAIL debe estar verificado en SES.
-    """
-    if not QA_EMAILS or not FROM_EMAIL:
-        print("QA_EMAILS o FROM_EMAIL no configurados, no se enviará correo.")
-        return
-
-    recipients = [e.strip() for e in QA_EMAILS.split(",") if e.strip()]
-    if not recipients:
-        print("No hay correos QA válidos.")
-        return
-
-    subject = f"Nuevo incidente reportado: {incident.get('title', 'Sin título')}"
-    body_text = (
-        "Se ha registrado un nuevo incidente:\n\n"
-        f"ID: {incident.get('incidentId')}\n"
-        f"Título: {incident.get('title')}\n"
-        f"Descripción: {incident.get('description')}\n"
-        f"Ubicación: {incident.get('location')}\n"
-        f"Urgencia: {incident.get('urgency')}\n"
-        f"Estado: {incident.get('status')}\n"
-        f"Reportado por: {incident.get('reportedBy')}\n"
-        f"Fecha: {incident.get('createdAt')}\n"
-    )
-
-    try:
-        print(f"Enviando correo a QA: {recipients}")
-        ses.send_email(
-            Source=FROM_EMAIL,
-            Destination={"ToAddresses": recipients},
-            Message={
-                "Subject": {"Data": subject},
-                "Body": {"Text": {"Data": body_text}},
-            },
-        )
-    except ClientError as e:
-        print("Error enviando correo SES:", e)
-
+# -----------------------------------------------------
+# WEB SOCKET MANAGEMENT API
+# -----------------------------------------------------
 
 def _get_apigw_client():
-    """
-    Cliente para API Gateway Management API, usando el WS_ENDPOINT
-    que tienes configurado en las env vars.
-    """
     if not WS_ENDPOINT:
-        raise RuntimeError("WS_ENDPOINT no está configurado")
+        raise RuntimeError("WS_ENDPOINT no configurado")
 
     return boto3.client("apigatewaymanagementapi", endpoint_url=WS_ENDPOINT)
 
 
-def _notify_all_connections(payload):
+def _notify_all_connections(incident, action="notify"):
     """
-    Envía un mensaje con action: "notify" a TODAS las conexiones
-    guardadas en la tabla CONNECTIONS_TABLE.
+    Envía mensaje WebSocket: { action: "...", incident: {...} }
+    a todas las conexiones activas en DynamoDB.
     """
-    if not CONNECTIONS_TABLE:
-        print("CONNECTIONS_TABLE no configurado, no se enviarán notificaciones.")
-        return
-
     table = dynamodb.Table(CONNECTIONS_TABLE)
     apigw = _get_apigw_client()
 
-    # message que verá el WebSocket en el front
     message = {
-        "action": "notify",  # 👈 lo que tu front va a leer
-        **payload,
+        "action": action,
+        "incident": incident,
     }
 
     data_bytes = json.dumps(message).encode("utf-8")
 
-    scan_kwargs = {"TableName": CONNECTIONS_TABLE}
-    response = table.scan()
-    connections = response.get("Items", [])
+    resp = table.scan()
+    connections = resp.get("Items", [])
 
-    print(f"Enviando notificación a {len(connections)} conexiones WebSocket.")
+    print(f"Notificando a {len(connections)} conexiones WebSocket...")
 
     for conn in connections:
         connection_id = conn.get("connectionId")
@@ -114,140 +76,206 @@ def _notify_all_connections(payload):
             continue
 
         try:
-            apigw.post_to_connection(ConnectionId=connection_id, Data=data_bytes)
+            apigw.post_to_connection(
+                ConnectionId=connection_id,
+                Data=data_bytes
+            )
         except ClientError as e:
             status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             print(f"Error enviando a {connection_id}: {e}")
+
+            # 410: conexión muerta → eliminar de DynamoDB
             if status == 410:
-                # Conexión muerta, la borramos
-                print(f"Conexión {connection_id} muerta, eliminando.")
+                print(f"Conexión {connection_id} muerta. Eliminando.")
                 table.delete_item(Key={"connectionId": connection_id})
 
 
-# ---------- HANDLERS PUBLICOS ----------
+# -----------------------------------------------------
+# SNS (CORREOS)
+# -----------------------------------------------------
+
+def _publish_to_sns(incident):
+    print("Publicando incidente en SNS...")
+
+    if not SNS_TOPIC_ARN:
+        print("SNS_TOPIC_ARN no configurado.")
+        return
+
+    subject = f"Nuevo incidente: {incident.get('title')}"
+
+    message = (
+        "Se ha registrado un nuevo incidente:\n\n"
+        f"ID: {incident.get('incidentId')}\n"
+        f"Título: {incident.get('title')}\n"
+        f"Descripción: {incident.get('description')}\n"
+        f"Ubicación: {incident.get('location')}\n"
+        f"Urgencia: {incident.get('urgency')}\n"
+        f"Estado: {incident.get('status')}\n"
+        f"Reporte: {incident.get('reportedBy')}\n"
+        f"Fecha: {incident.get('createdAt')}\n"
+    )
+
+    try:
+        resp = sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=message,
+        )
+        print("SNS enviado correctamente. MessageId:", resp.get("MessageId"))
+    except Exception as e:
+        print("Error enviando SNS:", e)
+
+
+# -----------------------------------------------------
+# POST /incidentes   (CREAR INCIDENTE)
+# -----------------------------------------------------
 
 def crear_incidente(event, context):
     """
-    POST /incidentes
-    Crea incidente, envía correo QA y notifica via WebSocket (action: 'notify')
+    Crea un incidente. Soporta dos formatos de body:
+
+    1) SIMPLE (frontend):
+        {
+          "title": "...",
+          "location": "...",
+          "description": "...",
+          "urgency": "alta",
+          "status": "pendiente",
+          "reportedBy": "Marco"
+        }
+
+    2) FORMATO WS:
+        {
+          "action": "notify",
+          "incident": {
+            "type": "infraestructura",
+            "location": "...",
+            "description": "...",
+            "urgency": "alta",
+            "status": "pendiente",
+            "reportedBy": "Marco"
+          }
+        }
     """
+
     print("Evento crear_incidente:", event)
 
     try:
         body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _response(400, {"message": "Body inválido, debe ser JSON"})
+    except:
+        return _response(400, {"ok": False, "message": "JSON inválido"})
 
+    # Si viene como { incident: {...} }, usamos ese objeto
+    if "incident" in body and isinstance(body["incident"], dict):
+        payload = body["incident"]
+    else:
+        payload = body
+
+    # Crear ID y fecha
     incident_id = str(uuid.uuid4())
-    now_iso = datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
 
+    # Construir incidente final
     incident = {
         "incidentId": incident_id,
-        "title": body.get("title", "Incidente sin título"),
-        "description": body.get("description", ""),
-        "location": body.get("location", ""),
-        "urgency": body.get("urgency", "media"),
-        "status": body.get("status", "pendiente"),
-        "reportedBy": body.get("reportedBy", "anónimo"),
-        "createdAt": now_iso,
+        "title": payload.get("title") or payload.get("type") or "Incidente sin título",
+        "description": payload.get("description", ""),
+        "location": payload.get("location", ""),
+        "urgency": payload.get("urgency") or payload.get("priority") or "media",
+        "status": payload.get("status", "pendiente"),
+        "reportedBy": payload.get("reportedBy", "anónimo"),
+        "createdAt": now,
     }
+
+    print("Incidente construido:", incident)
 
     table = dynamodb.Table(INCIDENTS_TABLE)
 
     try:
+        # 1. Guardar en DynamoDB
         table.put_item(Item=incident)
-        # 1. Enviar correo a QA
-        _send_email_to_qa(incident)
-        # 2. Notificar a todos los clientes WebSocket
-        _notify_all_connections(
-            {
-                "incidentId": incident_id,
-                "title": incident["title"],
-                "urgency": incident["urgency"],
-                "location": incident["location"],
-                "status": incident["status"],
-                "createdAt": incident["createdAt"],
-            }
-        )
+
+        # 2. Enviar correo SNS
+        _publish_to_sns(incident)
+
+        # 3. Enviar notificación WebSocket
+        _notify_all_connections(incident, action="notify")
 
         return _response(
             201,
             {
                 "ok": True,
-                "message": "Incidente creado, correo enviado y notificación enviada",
+                "message": "Incidente creado + SNS + WebSocket enviado",
                 "incident": incident,
-            },
-        )
-    except ClientError as e:
-        print("Error al crear incidente:", e)
-        return _response(
-            500,
-            {"ok": False, "message": "Error al crear incidente", "error": str(e)},
+            }
         )
 
+    except Exception as e:
+        print("Error creando incidente:", e)
+        return _response(500, {"ok": False, "message": "Error interno", "error": str(e)})
+
+
+# -----------------------------------------------------
+# GET /incidentes
+# -----------------------------------------------------
 
 def listar_incidentes(event, context):
-    """
-    GET /incidentes
-    """
     print("Evento listar_incidentes:", event)
 
     table = dynamodb.Table(INCIDENTS_TABLE)
+
     try:
         resp = table.scan()
-        items = resp.get("Items", [])
-        return _response(200, {"ok": True, "items": items})
-    except ClientError as e:
-        print("Error al listar incidentes:", e)
-        return _response(500, {"ok": False, "message": "Error al listar", "error": str(e)})
+        return _response(200, {"ok": True, "items": resp.get("Items", [])})
+    except Exception as e:
+        print("Error listando incidentes:", e)
+        return _response(500, {"ok": False, "message": "Error listando"})
 
+
+# -----------------------------------------------------
+# PATCH /incidentes/{id}
+# -----------------------------------------------------
 
 def actualizar_incidente(event, context):
-    """
-    PATCH /incidentes/{id}
-    """
     print("Evento actualizar_incidente:", event)
 
-    path_params = event.get("pathParameters") or {}
-    incident_id = path_params.get("id")
+    params = event.get("pathParameters") or {}
+    incident_id = params.get("id")
 
     if not incident_id:
-        return _response(400, {"message": "Falta id en la ruta"})
+        return _response(400, {"ok": False, "message": "Falta ID"})
 
     try:
         body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _response(400, {"message": "Body inválido, debe ser JSON"})
+    except:
+        return _response(400, {"ok": False, "message": "JSON inválido"})
 
-    # Construimos UpdateExpression dinámico
-    update_expr_parts = []
-    expr_attr_values = {}
-    expr_attr_names = {}
+    update_parts = []
+    expr_names = {}
+    expr_values = {}
 
     for key in ["title", "description", "location", "urgency", "status", "reportedBy"]:
         if key in body:
-            update_expr_parts.append(f"#k_{key} = :v_{key}")
-            expr_attr_values[f":v_{key}"] = body[key]
-            expr_attr_names[f"#k_{key}"] = key
+            update_parts.append(f"#k_{key} = :v_{key}")
+            expr_names[f"#k_{key}"] = key
+            expr_values[f":v_{key}"] = body[key]
 
-    if not update_expr_parts:
-        return _response(400, {"message": "No hay campos para actualizar"})
-
-    update_expr = "SET " + ", ".join(update_expr_parts)
+    if not update_parts:
+        return _response(400, {"ok": False, "message": "Nada que actualizar"})
 
     table = dynamodb.Table(INCIDENTS_TABLE)
 
     try:
         resp = table.update_item(
             Key={"incidentId": incident_id},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames=expr_attr_names,
-            ExpressionAttributeValues=expr_attr_values,
+            UpdateExpression="SET " + ", ".join(update_parts),
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
             ReturnValues="ALL_NEW",
         )
 
-        updated = resp.get("Attributes", {})
-        return _response(200, {"ok": True, "incident": updated})
-    except ClientError as e:
-        print("Error al actualizar incidente:", e)
-        return _response(500, {"ok": False, "message": "Error al actualizar", "error": str(e)})
+        return _response(200, {"ok": True, "incident": resp.get("Attributes")})
+
+    except Exception as e:
+        print("Error actualizando incidente:", e)
+        return _response(500, {"ok": False, "message": "Error actualizando"})
